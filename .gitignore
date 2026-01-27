@@ -1,0 +1,31 @@
+# Large dataset files
+FaceForensics++_C23/
+FaceForensics++_C23.rar
+data.7z
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model checkpoints (optional - uncomment if you don't want to track them)
+# runs/*.pth
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

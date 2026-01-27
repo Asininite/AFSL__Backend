@@ -1,0 +1,8 @@
+opencv-python
+mtcnn
+tqdm
+torch
+torchvision
+pandas
+pillow
+scikit-learn
