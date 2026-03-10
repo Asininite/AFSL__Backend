@@ -7,8 +7,9 @@ import sys
 import base64
 import io
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
+import cv2
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -16,6 +17,7 @@ from PIL import Image, ImageFilter
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from mtcnn import MTCNN
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -53,15 +55,21 @@ BASELINE_MODEL_PATH = RUNS_DIR / "tinker_baseline_epoch_5.pth"
 AFSL_MODEL_PATH = RUNS_DIR / "afsl_epoch_6.pth"
 
 # Global model instances
+face_detector = None
 baseline_model = None
 afsl_model = None
 
 
 def load_models():
-    """Load both models into memory."""
-    global baseline_model, afsl_model
+    """Load both models and face detector into memory."""
+    global baseline_model, afsl_model, face_detector
     
     print(f"Loading models on device: {DEVICE}")
+    
+    # Load MTCNN face detector
+    print("Loading MTCNN face detector...")
+    face_detector = MTCNN()
+    print("✓ MTCNN face detector loaded")
     
     # Load Baseline model
     print(f"Loading Baseline model from: {BASELINE_MODEL_PATH}")
@@ -100,6 +108,39 @@ def decode_base64_image(base64_string: str) -> Image.Image:
     image_bytes = base64.b64decode(base64_string)
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return image
+
+
+def extract_face(image: Image.Image) -> Optional[Image.Image]:
+    """
+    Detect and crop the largest face from a PIL Image using MTCNN.
+    Returns the cropped face as a PIL Image, or None if no face is found.
+    This matches the training preprocessing (tools/face_preprocess.py).
+    """
+    rgb_array = np.array(image)
+    
+    try:
+        detections = face_detector.detect_faces(rgb_array)
+    except Exception:
+        return None
+    
+    if not detections:
+        return None
+    
+    # Pick the largest face (same logic as face_preprocess.py)
+    largest = max(detections, key=lambda d: d["box"][2] * d["box"][3])
+    x, y, w, h = largest["box"]
+    
+    # Clamp to image boundaries
+    x, y = max(0, x), max(0, y)
+    x2 = min(x + w, rgb_array.shape[1])
+    y2 = min(y + h, rgb_array.shape[0])
+    
+    face_crop = rgb_array[y:y2, x:x2]
+    
+    if face_crop.size == 0:
+        return None
+    
+    return Image.fromarray(face_crop)
 
 
 def predict(model: torch.nn.Module, image: Image.Image) -> dict:
@@ -234,11 +275,13 @@ class PredictionResult(BaseModel):
 class PredictResponse(BaseModel):
     baseline: PredictionResult
     afsl: PredictionResult
+    face_detected: bool
+    cropped_face: Optional[str] = None  # Base64 encoded cropped face
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Load models when server starts."""
+    """Load models and face detector when server starts."""
     load_models()
 
 
@@ -259,6 +302,7 @@ async def root():
 async def predict_endpoint(request: PredictRequest):
     """
     Predict if an image is real or fake using both models.
+    Extracts the face from the image first (matching training preprocessing).
     
     Args:
         request: JSON body with base64-encoded image
@@ -272,13 +316,24 @@ async def predict_endpoint(request: PredictRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
     
-    # Run predictions
-    baseline_result = predict(baseline_model, image)
-    afsl_result = predict(afsl_model, image)
+    # Extract face from the image (matches training pipeline)
+    face_image = extract_face(image)
+    
+    if face_image is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No face detected in the image. Please upload an image containing a clearly visible face."
+        )
+    
+    # Run predictions on the cropped face
+    baseline_result = predict(baseline_model, face_image)
+    afsl_result = predict(afsl_model, face_image)
     
     return {
         "baseline": baseline_result,
-        "afsl": afsl_result
+        "afsl": afsl_result,
+        "face_detected": True,
+        "cropped_face": encode_image_base64(face_image),
     }
 
 
@@ -304,6 +359,7 @@ class AdversarialResponse(BaseModel):
 async def adversarial_endpoint(request: AdversarialRequest):
     """
     Generate an adversarial image and compare model predictions.
+    Extracts the face first, then applies attacks to the cropped face.
     
     Args:
         request: JSON body with base64-encoded image, attack_type, and epsilon
@@ -317,20 +373,29 @@ async def adversarial_endpoint(request: AdversarialRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
     
-    # Get predictions on original image
-    baseline_original = predict(baseline_model, original_image)
-    afsl_original = predict(afsl_model, original_image)
+    # Extract face from the image (matches training pipeline)
+    face_image = extract_face(original_image)
     
-    # Generate adversarial image based on attack type
+    if face_image is None:
+        raise HTTPException(
+            status_code=422,
+            detail="No face detected in the image. Please upload an image containing a clearly visible face."
+        )
+    
+    # Get predictions on original face crop
+    baseline_original = predict(baseline_model, face_image)
+    afsl_original = predict(afsl_model, face_image)
+    
+    # Generate adversarial image based on attack type (on the face crop)
     attack_type = request.attack_type
     epsilon = request.epsilon
     
     if attack_type == "blur":
         # Blur attack works directly on PIL image
-        adversarial_image = blur_attack(original_image, epsilon)
+        adversarial_image = blur_attack(face_image, epsilon)
     else:
-        # Convert to tensor for gradient-based attacks
-        image_tensor = pil_to_tensor(original_image)
+        # Convert face crop to tensor for gradient-based attacks
+        image_tensor = pil_to_tensor(face_image)
         
         if attack_type == "fgsm":
             perturbed_tensor = fgsm_attack(baseline_model, image_tensor, epsilon)
