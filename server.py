@@ -1,5 +1,6 @@
 """
 FastAPI server for deepfake detection using AFSL and Baseline models.
+Also provides a privacy filter using the Carlini-Wagner L2 attack.
 Run with: uvicorn server:app --reload --port 8000
 """
 
@@ -58,11 +59,12 @@ AFSL_MODEL_PATH = RUNS_DIR / "afsl_epoch_6.pth"
 face_detector = None
 baseline_model = None
 afsl_model = None
+ensemble_model = None  # For privacy filter
 
 
 def load_models():
-    """Load both models and face detector into memory."""
-    global baseline_model, afsl_model, face_detector
+    """Load both models, face detector, and ensemble for privacy filter."""
+    global baseline_model, afsl_model, face_detector, ensemble_model
     
     print(f"Loading models on device: {DEVICE}")
     
@@ -86,6 +88,12 @@ def load_models():
     afsl_model.to(DEVICE)
     afsl_model.eval()
     print("✓ AFSL model loaded")
+    
+    # Load ensemble feature extractors for privacy filter
+    print("Loading ensemble feature extractors (ResNet-50, VGG-16, DenseNet-121)...")
+    from attacks.cw import EnsembleFeatureExtractor
+    ensemble_model = EnsembleFeatureExtractor(device=DEVICE)
+    print("✓ Ensemble feature extractors loaded")
 
 
 # ============== Image Processing ==============
@@ -427,6 +435,142 @@ async def adversarial_endpoint(request: AdversarialRequest):
             "adversarial": afsl_adversarial
         }
     }
+
+# ============== Privacy Filter (Ensemble Transferable Attack) ==============
+
+import json
+import asyncio
+import threading
+from fastapi.responses import StreamingResponse
+from attacks.cw import privacy_attack
+
+# Strength presets: tuned for smooth, imperceptible perturbation.
+# Gradient smoothing keeps noise natural; lower TV weight preserves attack power.
+STRENGTH_PRESETS = {
+    "low":    {"epsilon": 4/255,  "num_iterations": 200, "alpha": 0.3/255,
+               "momentum": 0.9, "tv_weight": 0.15, "smooth_sigma": 1.5,
+               "smooth_kernel": 7, "use_input_diversity": True},
+    "medium": {"epsilon": 8/255,  "num_iterations": 300, "alpha": 0.4/255,
+               "momentum": 0.9, "tv_weight": 0.1, "smooth_sigma": 1.5,
+               "smooth_kernel": 7, "use_input_diversity": True},
+    "high":   {"epsilon": 12/255, "num_iterations": 400, "alpha": 0.5/255,
+               "momentum": 0.9, "tv_weight": 0.08, "smooth_sigma": 1.0,
+               "smooth_kernel": 5, "use_input_diversity": True},
+}
+
+
+class PrivacyFilterRequest(BaseModel):
+    image: str  # Base64 encoded image
+    strength: Literal["low", "medium", "high"] = "medium"
+
+
+@app.post("/api/privacy-filter")
+async def privacy_filter_endpoint(request: PrivacyFilterRequest):
+    """
+    Apply a transferable ensemble adversarial attack to protect an image
+    from reverse image search and face-recognition systems.
+
+    Uses ResNet-50 + VGG-16 + DenseNet-121 ensemble with input diversity
+    and momentum for maximum transferability to unknown models.
+
+    Returns an SSE stream with progress events and a final result event.
+    """
+    try:
+        image = decode_base64_image(request.image)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
+
+    original_size = image.size  # (width, height) — preserve for later
+
+    # Resize to 224×224 for the ensemble models
+    image_tensor = pil_to_tensor(image)  # (1, 3, 224, 224) in [0, 1]
+
+    params = STRENGTH_PRESETS[request.strength]
+
+    # --- SSE streaming with real progress ---
+    progress_queue = asyncio.Queue()
+    loop = asyncio.get_event_loop()
+    result_holder = {}
+
+    def progress_callback(current, total, info):
+        """Called by the attack from the worker thread."""
+        pct = min(round(current / total * 100), 100)
+        asyncio.run_coroutine_threadsafe(
+            progress_queue.put({
+                "type": "progress",
+                "percent": pct,
+                "cos_sim": info.get("cos_sim"),
+                "l2": info.get("l2"),
+                "step": f"Iteration {info.get('iteration')}",
+            }),
+            loop,
+        )
+
+    def run_attack():
+        """Run the ensemble attack (blocking) in a worker thread."""
+        try:
+            protected_tensor, stats = privacy_attack(
+                ensemble=ensemble_model,
+                image_tensor=image_tensor,
+                progress_callback=progress_callback,
+                **params,
+            )
+
+            # --- Preserve original aspect ratio ---
+            with torch.no_grad():
+                delta_224 = protected_tensor - image_tensor
+
+                orig_h, orig_w = original_size[1], original_size[0]
+                delta_full = torch.nn.functional.interpolate(
+                    delta_224,
+                    size=(orig_h, orig_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
+                original_full = np.array(image).astype(np.float32) / 255.0
+                original_full_t = torch.from_numpy(original_full).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+                protected_full_t = torch.clamp(original_full_t + delta_full, 0, 1)
+
+                protected_array = (protected_full_t.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                protected_pil = Image.fromarray(protected_array)
+
+            result_holder["result"] = {
+                "protected_image": encode_image_base64(protected_pil),
+                "l2_distance": round(stats["l2_distance"], 4),
+                "original_similarity": stats["cos_sim_orig"],
+                "protected_similarity": round(stats["cos_sim_adv"], 4),
+            }
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            result_holder["error"] = str(exc)
+
+        asyncio.run_coroutine_threadsafe(progress_queue.put(None), loop)
+
+    thread = threading.Thread(target=run_attack, daemon=True)
+    thread.start()
+
+    async def event_stream():
+        while True:
+            msg = await progress_queue.get()
+            if msg is None:
+                if "error" in result_holder:
+                    yield f"data: {json.dumps({'type': 'error', 'detail': result_holder['error']})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'result', **result_holder['result']})}\n\n"
+                break
+            yield f"data: {json.dumps(msg)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ============== Run Server ==============
