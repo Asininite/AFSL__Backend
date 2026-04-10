@@ -87,17 +87,26 @@ class EnsembleFeatureExtractor(nn.Module):
     The average cosine similarity across all three is the attack objective.
     """
 
-    def __init__(self, device="cpu"):
+    def __init__(self, device="cpu", models_to_use=None):
         super().__init__()
         self.device = device
+        # models_to_use: list of model names to include, e.g. ["resnet", "vgg", "densenet"]
+        # Default: all three
+        if models_to_use is None:
+            models_to_use = ["resnet", "vgg", "densenet"]
+        self.active_models = models_to_use
 
-        resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
-        densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+        if "resnet" in models_to_use:
+            resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+            self.resnet_features = nn.Sequential(*list(resnet.children())[:-1])
 
-        self.resnet_features = nn.Sequential(*list(resnet.children())[:-1])
-        self.vgg_features = vgg.features
-        self.densenet_features = densenet.features
+        if "vgg" in models_to_use:
+            vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
+            self.vgg_features = vgg.features
+
+        if "densenet" in models_to_use:
+            densenet = models.densenet121(weights=models.DenseNet121_Weights.DEFAULT)
+            self.densenet_features = densenet.features
 
         self.to(device)
         self.eval()
@@ -107,17 +116,20 @@ class EnsembleFeatureExtractor(nn.Module):
     def _extract(self, x):
         features = []
 
-        f = self.resnet_features(x)
-        features.append(f.flatten(1))
+        if "resnet" in self.active_models:
+            f = self.resnet_features(x)
+            features.append(f.flatten(1))
 
-        f = self.vgg_features(x)
-        f = F.adaptive_avg_pool2d(f, 1)
-        features.append(f.flatten(1))
+        if "vgg" in self.active_models:
+            f = self.vgg_features(x)
+            f = F.adaptive_avg_pool2d(f, 1)
+            features.append(f.flatten(1))
 
-        f = self.densenet_features(x)
-        f = F.relu(f)
-        f = F.adaptive_avg_pool2d(f, 1)
-        features.append(f.flatten(1))
+        if "densenet" in self.active_models:
+            f = self.densenet_features(x)
+            f = F.relu(f)
+            f = F.adaptive_avg_pool2d(f, 1)
+            features.append(f.flatten(1))
 
         return features
 
@@ -165,6 +177,7 @@ def privacy_attack(
     smooth_sigma: float = 1.5,
     smooth_kernel: int = 7,
     use_input_diversity: bool = True,
+    use_color_reg: bool = True,
     progress_callback=None,
 ):
     """
@@ -215,10 +228,11 @@ def privacy_attack(
         tv = total_variation_loss(delta)
 
         # Colour regularisation — prevent independent per-channel perturbation
-        color_reg = color_regularisation_loss(delta)
-
-        # Total loss: decrease cosine sim + spatial smoothness + colour coherence
-        loss = cos_sim + tv_weight * tv + tv_weight * 0.5 * color_reg
+        if use_color_reg:
+            color_reg = color_regularisation_loss(delta)
+            loss = cos_sim + tv_weight * tv + tv_weight * 0.5 * color_reg
+        else:
+            loss = cos_sim + tv_weight * tv
 
         loss.backward()
 
@@ -239,7 +253,8 @@ def privacy_attack(
             delta.data = delta.data - alpha * grad_momentum.sign()
 
             # Correlate channels to prevent rainbow artifacts
-            delta.data = correlate_channels(delta.data, mix=0.6)
+            if use_color_reg:
+                delta.data = correlate_channels(delta.data, mix=0.6)
 
             # Project onto L∞ ε-ball and [0, 1]
             delta.data = torch.clamp(delta.data, -epsilon, epsilon)
@@ -249,7 +264,8 @@ def privacy_attack(
             if (i + 1) % 20 == 0:
                 delta.data = smooth_gradient(delta.data, kernel_size=smooth_kernel,
                                              sigma=smooth_sigma * 0.3)
-                delta.data = correlate_channels(delta.data, mix=0.6)
+                if use_color_reg:
+                    delta.data = correlate_channels(delta.data, mix=0.6)
                 delta.data = torch.clamp(delta.data, -epsilon, epsilon)
                 delta.data = torch.clamp(x + delta.data, 0, 1) - x
 
@@ -267,7 +283,8 @@ def privacy_attack(
     with torch.no_grad():
         final_delta = delta.detach()
         # Correlate channels and smooth
-        final_delta = correlate_channels(final_delta, mix=0.6)
+        if use_color_reg:
+            final_delta = correlate_channels(final_delta, mix=0.6)
         final_delta = smooth_gradient(final_delta, kernel_size=5,
                                       sigma=smooth_sigma * 0.5)
         final_delta = torch.clamp(final_delta, -epsilon, epsilon)
