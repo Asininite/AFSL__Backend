@@ -9,6 +9,7 @@ import base64
 import io
 from pathlib import Path
 from typing import Literal, Optional
+from contextlib import asynccontextmanager
 
 import cv2
 import torch
@@ -25,15 +26,22 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
 from models.detector import Detector
-from config import DEVICE, RUNS_DIR, IMAGE_SIZE, NORM_MEAN, NORM_STD
+from config import DEVICE, RUNS_DIR, IMAGE_SIZE, NORM_MEAN, NORM_STD, DECISION_THRESHOLD
 from torchvision import transforms
 
 # ============== App Setup ==============
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load models and face detector when server starts."""
+    load_models()
+    yield
+
 app = FastAPI(
     title="Deepfake Detection API",
     description="API for detecting deepfakes using AFSL and Baseline models",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 # CORS middleware to allow requests from Next.js frontend
@@ -107,6 +115,8 @@ def get_inference_transforms():
     ])
 
 
+MAX_IMAGE_SIZE_MB = 10
+
 def decode_base64_image(base64_string: str) -> Image.Image:
     """Decode a base64 image string to PIL Image."""
     # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,")
@@ -114,6 +124,12 @@ def decode_base64_image(base64_string: str) -> Image.Image:
         base64_string = base64_string.split(",", 1)[1]
     
     image_bytes = base64.b64decode(base64_string)
+    
+    # Reject images larger than MAX_IMAGE_SIZE_MB
+    size_mb = len(image_bytes) / (1024 * 1024)
+    if size_mb > MAX_IMAGE_SIZE_MB:
+        raise ValueError(f"Image too large ({size_mb:.1f} MB). Maximum is {MAX_IMAGE_SIZE_MB} MB.")
+    
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     return image
 
@@ -160,8 +176,8 @@ def predict(model: torch.nn.Module, image: Image.Image) -> dict:
         _, logits = model(img_tensor)
         probability = torch.sigmoid(logits).item()
     
-    # Label: 1 = Real, 0 = Fake (threshold 0.6 as per evaluate.py)
-    is_real = probability > 0.6
+    # Label: 1 = Real, 0 = Fake
+    is_real = probability > DECISION_THRESHOLD
     
     # Confidence is how sure the model is of its prediction
     confidence = probability if is_real else (1 - probability)
@@ -200,15 +216,15 @@ def pil_to_tensor(image: Image.Image) -> torch.Tensor:
 def fgsm_attack(model: torch.nn.Module, image_tensor: torch.Tensor, epsilon: float) -> torch.Tensor:
     """
     Fast Gradient Sign Method (FGSM) attack.
-    Tries to flip the prediction by adding perturbation in the gradient direction.
+    Flips the prediction by maximizing loss against the opposite of current prediction.
     """
     model.eval()
     image_tensor = image_tensor.clone().detach().requires_grad_(True)
     
     _, logits = model(image_tensor)
-    # Use current prediction as target (attack wants to flip it)
     prob = torch.sigmoid(logits)
-    target = (prob > 0.5).float()
+    # Flip the prediction to create a target that maximizes loss
+    target = 1.0 - (prob > 0.5).float()
     
     loss = F.binary_cross_entropy_with_logits(logits.view(-1), target.view(-1))
     loss.backward()
@@ -225,6 +241,7 @@ def pgd_attack_adversarial(model: torch.nn.Module, image_tensor: torch.Tensor,
                            epsilon: float, alpha: float = None, steps: int = 10) -> torch.Tensor:
     """
     Projected Gradient Descent (PGD) attack - iterative FGSM.
+    Determines flipped target once, then iterates to maximize loss.
     """
     if alpha is None:
         alpha = epsilon / 4
@@ -233,11 +250,14 @@ def pgd_attack_adversarial(model: torch.nn.Module, image_tensor: torch.Tensor,
     original = image_tensor.clone().detach()
     perturbed = image_tensor.clone().detach()
     
+    # Determine target once (flip original prediction)
+    with torch.no_grad():
+        _, logits_orig = model(original)
+        target = 1.0 - (torch.sigmoid(logits_orig) > 0.5).float()
+    
     for _ in range(steps):
         perturbed.requires_grad_(True)
         _, logits = model(perturbed)
-        prob = torch.sigmoid(logits)
-        target = (prob > 0.5).float()
         
         loss = F.binary_cross_entropy_with_logits(logits.view(-1), target.view(-1))
         grad = torch.autograd.grad(loss, perturbed)[0]
@@ -286,11 +306,6 @@ class PredictResponse(BaseModel):
     face_detected: bool
     cropped_face: Optional[str] = None  # Base64 encoded cropped face
 
-
-@app.on_event("startup")
-async def startup_event():
-    """Load models and face detector when server starts."""
-    load_models()
 
 
 @app.get("/")
@@ -447,13 +462,13 @@ from attacks.cw import privacy_attack
 # Strength presets: tuned for smooth, imperceptible perturbation.
 # Gradient smoothing keeps noise natural; lower TV weight preserves attack power.
 STRENGTH_PRESETS = {
-    "low":    {"epsilon": 4/255,  "num_iterations": 200, "alpha": 0.3/255,
+    "low":    {"epsilon": 4/255,  "num_iterations": 100, "alpha": 0.3/255,
                "momentum": 0.9, "tv_weight": 0.15, "smooth_sigma": 1.5,
                "smooth_kernel": 7, "use_input_diversity": True},
-    "medium": {"epsilon": 8/255,  "num_iterations": 300, "alpha": 0.4/255,
+    "medium": {"epsilon": 8/255,  "num_iterations": 150, "alpha": 0.4/255,
                "momentum": 0.9, "tv_weight": 0.1, "smooth_sigma": 1.5,
                "smooth_kernel": 7, "use_input_diversity": True},
-    "high":   {"epsilon": 12/255, "num_iterations": 400, "alpha": 0.5/255,
+    "high":   {"epsilon": 12/255, "num_iterations": 200, "alpha": 0.5/255,
                "momentum": 0.9, "tv_weight": 0.08, "smooth_sigma": 1.0,
                "smooth_kernel": 5, "use_input_diversity": True},
 }
